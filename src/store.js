@@ -8,12 +8,16 @@
  *        FLAP 代币额外携带 taxRate / buyTaxRate / sellTaxRate / dividendBps 等。
  *
  * ★ 无缓冲原则（CA 直接匹配）：
- *   updatePrice / addWalletSignal / addTrade / enrich 均以 tokenMap 里的 CA 为唯一依据，
- *   CA 不存在 → 直接丢弃，不做任何缓存 / 延迟回放。
+ *   updatePrice / updateMarketCapFromLog / addWalletSignal / addTrade / enrich
+ *   均以 tokenMap 里的 CA 为唯一依据，CA 不存在 → 直接丢弃，不做任何缓存 / 延迟回放。
  *
- * ★ 真实交易者（GMGN 口径）：
- *   交易先按事件地址毫秒上屏，再用 maker.js 异步解析 tx.from 回写，
- *   不同则 emit 'trade_maker' 让前端就地修正，并用 tx.from 复查 KOL 钱包。
+ * ★ 交易者地址：完全以链上 LOG 为准（FLAP: TokenBought/TokenSold 的 user 字段）。
+ *   已删除 tx.from 校正逻辑（maker.js / _resolveTradeMaker / trade_maker），
+ *   不再对事件地址做任何二次改写，明细里显示的就是 LOG 里的地址。
+ *
+ * ★ FLAP 市值口径（updateMarketCapFromLog）：
+ *   市值 = LOG 里的价格(postPrice) x 真实总发行量(totalSupply) [x BNB 价]
+ *   拿不到真实价格或真实 totalSupply 时不写市值，绝不用默认发行量/估算值兜底。
  */
 
 const { EventEmitter } = require('events');
@@ -27,30 +31,15 @@ class TokenStore extends EventEmitter {
     this.walletBuyMCThreshold = opts.walletBuyMCThreshold || 5100;
     this._onMatched = opts.onMatched || null;
     this._boughtNames = new Set();
+    // 仅 four.meme 在 totalSupply 缺失时使用的兜底值；FLAP 不使用（见 updateMarketCapFromLog）
     this._defaultSupply = 1073972602.739726;
 
-    // 真实交易者解析（由 index.js 注入 MakerResolver）
-    this._maker = null;
-    this.watchWallets = new Map();   // address(lower) → KOL 名
-
-    // 丢弃/修正计数（可在 /api/status 排查）
-    this.stats = { dropPrice: 0, dropSignal: 0, dropTrade: 0, makerFixed: 0, makerKol: 0 };
+    // 丢弃计数（可在 /api/status 排查）
+    this.stats = { dropPrice: 0, dropSignal: 0, dropTrade: 0, mcNoSupply: 0, mcNoPrice: 0 };
   }
 
   setBNBPrice(price) {
     if (price > 0) this.bnbPriceUSD = price;
-  }
-
-  /** 注入真实交易者解析器（src/maker.js） */
-  setMakerResolver(resolver) { this._maker = resolver || null; }
-
-  /** 注入追踪钱包（用于 tx.from 复查 KOL） */
-  setWatchWallets(list) {
-    this.watchWallets = new Map(
-      (list || [])
-        .filter(w => w && w.address)
-        .map(w => [String(w.address).toLowerCase(), w.name])
-    );
   }
 
   /**
@@ -163,6 +152,10 @@ class TokenStore extends EventEmitter {
     return token;
   }
 
+  /**
+   * four.meme 口径：用成交额/成交量反推单价（price = eth / amount）
+   * ★ FLAP 不要用这个方法，FLAP 走 updateMarketCapFromLog（直接取 LOG 里的价格）
+   */
   updatePrice(ca, bnbAmount, tokenAmount, paymentToken) {
     const token = this.tokenMap.get(ca);
     if (!token) { this.stats.dropPrice++; return null; }   // 不缓冲，直接丢弃
@@ -181,6 +174,45 @@ class TokenStore extends EventEmitter {
     // 尝试买入触发
     this._tryWalletBuy(token);
     this.emit('price_updated', { token, priceBNB, marketCapUSD: priceUSD });
+    return token;
+  }
+
+  /**
+   * ★ FLAP 市值：完全用链上 LOG 的真实数据，不做任何模拟 / 猜测 / 反推
+   *
+   *   市值 = LOG 里的价格(postPrice, 已换算为「报价币 / 单个代币」)
+   *          x 真实总发行量(totalSupply(), 已换算为整枚)
+   *          x BNB 价（报价币是 BNB 时才乘；稳定币报价直接就是 USD）
+   *
+   * 硬性约束：价格或总发行量拿不到真实值时，直接返回、不写市值，
+   *          绝不用默认发行量（_defaultSupply）或估算值兜底。
+   *
+   * @param {string} ca           代币地址（小写）
+   * @param {string|number} logPrice   LOG 里的价格，单位=报价币/代币
+   * @param {string|number} totalSupply 真实总发行量（整枚）
+   * @param {boolean} isStableQuote    报价币是否为稳定币（是→市值即 USD，不乘 BNB 价）
+   */
+  updateMarketCapFromLog(ca, logPrice, totalSupply, isStableQuote = false) {
+    const token = this.tokenMap.get(ca);
+    if (!token) { this.stats.dropPrice++; return null; }   // 不缓冲，直接丢弃
+
+    const price = parseFloat(logPrice) || 0;
+    if (price <= 0) { this.stats.mcNoPrice++; return token; }
+
+    // 总发行量：优先入参（flap.js 刚从 totalSupply() 拿到的真实值），其次 token 上已存的真实值
+    const supply = parseFloat(totalSupply) || parseFloat(token.tamount) || parseFloat(token.totalSupply) || 0;
+    if (supply <= 0) { this.stats.mcNoSupply++; return token; }   // ★ 无真实发行量 → 不猜
+
+    token._lastPrice = price;
+    const mcQuote = price * supply;
+    const symbol = (token.symbol || '').toUpperCase();
+    const isStable = !!isStableQuote || ['USDT', 'USDC', 'USD1', 'U'].includes(symbol);
+    const marketCapUSD = isStable ? mcQuote : mcQuote * this.bnbPriceUSD;
+
+    token.marketCapUSD = marketCapUSD;
+    // 尝试买入触发（用与明细完全同一时刻、同一口径的市值）
+    this._tryWalletBuy(token);
+    this.emit('price_updated', { token, priceBNB: price, marketCapUSD });
     return token;
   }
 
@@ -266,66 +298,11 @@ class TokenStore extends EventEmitter {
     if (trade.buyTaxRate === undefined || trade.buyTaxRate === null) trade.buyTaxRate = token.buyTaxRate;
     if (trade.sellTaxRate === undefined || trade.sellTaxRate === null) trade.sellTaxRate = token.sellTaxRate;
     if (trade.dividendBps === undefined || trade.dividendBps === null) trade.dividendBps = token.dividendBps;
-    // 事件里的入账地址（可能是路由/机器人合约）先存一份
-    trade.eventAddress = trade.eventAddress || trade.userAddress || null;
+    // ★ userAddress 就是 LOG 里的交易者地址，不再做任何校正/改写
     // 无数量上限
     token.trades.push(trade);
     this.emit('trade_added', { token, trade });
-    // ★ 上屏之后再异步校正为真实交易者（GMGN 口径）
-    this._resolveTradeMaker(token, trade);
     return token;
-  }
-
-  /**
-   * 异步用 txHash 拿 tx.from（GMGN 展示的交易者）校正交易明细地址
-   * 不阻塞首屏；不一致时回写 + emit 'trade_maker' 供前端就地更新
-   */
-  _resolveTradeMaker(token, trade) {
-    const resolver = this._maker;
-    if (!resolver || !trade || !trade.txHash) return;
-    const eventAddr = String(trade.userAddress || '').toLowerCase();
-
-    resolver.resolve(trade.txHash).then((maker) => {
-      if (!maker || maker === eventAddr) return;
-
-      // 回写为真实发起人
-      trade.eventAddress = eventAddr || trade.eventAddress || null;
-      trade.userAddress  = maker;
-      trade.makerFixed   = true;
-      this.stats.makerFixed++;
-      if (resolver.stats) resolver.stats.mismatched++;
-
-      // tx.from 复查追踪(KOL)钱包：走路由/机器人的 KOL 交易之前会被漏掉
-      const kol = this.watchWallets.get(maker) || null;
-      if (kol) {
-        trade.walletName = kol;
-        trade.isWatch = true;
-        this.stats.makerKol++;
-        this.addWalletSignal(token.tokenId, {
-          time: trade.time,
-          walletName: kol,
-          walletAddress: maker,
-          action: trade.side === 'buy' ? '买入' : '卖出',
-          bnbAmount: trade.bnbAmount,
-          tokenAmount: trade.tokenAmount,
-          txHash: trade.txHash,
-          marketCapUSD: trade.marketCapUSD || token.marketCapUSD || 0,
-        });
-      }
-
-      console.log(`[Store] \u{1F50D} 交易者校正 | ${eventAddr.slice(0, 10)}...(事件) \u2192 ${maker.slice(0, 10)}...(tx.from${kol ? ' / KOL:' + kol : ''}) | tx:${String(trade.txHash).slice(0, 12)}...`);
-
-      this.emit('trade_maker', {
-        tokenAddress: token.tokenId,
-        txHash: trade.txHash,
-        side: trade.side,
-        userAddress: maker,
-        eventAddress: trade.eventAddress,
-        walletName: kol,
-        isWatch: !!kol,
-        platform: trade.platform || token.platform || 'four',
-      });
-    }).catch(() => {});
   }
 
   get(ca) { return this.tokenMap.get(ca) || null; }
@@ -339,7 +316,7 @@ class TokenStore extends EventEmitter {
     return Array.from(this.tokenMap.values()).sort((a, b) => b.arrivalTime - a.arrivalTime);
   }
   getStats() {
-    return { ...this.stats, maker: this._maker && this._maker.getStats ? this._maker.getStats() : null };
+    return { ...this.stats };
   }
 
   destroy() { /* 无定时器需清理（早到缓冲已删除） */ }
