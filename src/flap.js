@@ -4,13 +4,15 @@
  *
  * (1) 新币创建：Portal.TokenCreated  -> store.register(platform:'flap')
  *     ★ 只处理「程序启动之后」链上新创建的代币。
- * (2) 交易明细：Portal.TokenBought / TokenSold -> store.updatePrice + store.addTrade
- *     （字段格式与 four.meme 完全一致，前端 fm_trade 直接渲染；命中追踪钱包时带 walletName）
+ * (2) 交易明细：Portal.TokenBought / TokenSold -> store.updateMarketCapFromLog + store.addTrade
+ *     ★ 交易者地址 = LOG 里的 user 字段（d[2]），购买数量 = LOG 里的 amount 字段（d[3]），
+ *       一律直取链上日志，不再用 tx.from 校正（校正逻辑 maker.js 已删除）。
  * (3) 媒体/元数据：meta -> https://flap.mypinata.cloud/ipfs/<cid>
  *     ★ meta 可能是 JSON 的 CID / 图片本身的 CID / ipfs:// / http(s) / 内联 JSON，全部兼容。
  *     ★ 专用网关失败（403/超时）时自动换公共网关重试。
  *     「获取时间」= 媒体链接返回那一刻的实时时间（mediaAddressTime）
- * (4) 市值：实时价格(买/卖事件 eth/amount) x 真实总发行量(totalSupply) x BNB价
+ * (4) 市值：★ LOG 里的价格(postPrice) x 真实总发行量(totalSupply()) x BNB价
+ *     不做任何模拟 / 猜测 / 反推；价格或总发行量拿不到真实值时就不写市值。
  * (5) 税率：★ TaxTokenHelper.getTaxTokenInfoV2 返回真实的 buyTaxRate / sellTaxRate（BPS），
  *     旧版合约回退到 getTaxTokenInfo 的单一 taxRate。
  *     显示过滤：max(买税,卖税) <= 5% 且 dividendBps === 10000
@@ -177,7 +179,7 @@ class FlapWatcher extends EventEmitter {
     // 只跟踪「程序启动之后」创建的代币（含被前端过滤掉的）
     this._tokens = new Map();
     this._startedAt = 0;
-    this.stats = { created: 0, visible: 0, filtered: 0, taxUnknown: 0, trades: 0, tradesVisible: 0, tradesIgnoredOld: 0, mediaOk: 0, mediaFail: 0 };
+    this.stats = { created: 0, visible: 0, filtered: 0, taxUnknown: 0, trades: 0, tradesVisible: 0, tradesIgnoredOld: 0, mediaOk: 0, mediaFail: 0, logPriceWarn: 0 };
 
     this._createCh = null;
     this._tradeCh = null;
@@ -185,7 +187,7 @@ class FlapWatcher extends EventEmitter {
 
   setStore(store) { this.store = store; }
 
-  // ── 启动 / 停止 ────────────────────────────────────────────
+  // ── 启动 / 停止 ───────────────────────────────
   start() {
     this._startedAt = Date.now();
     this._verifyTopics();
@@ -222,6 +224,8 @@ class FlapWatcher extends EventEmitter {
 
     console.log(`[FLAP] 监控启动 | Portal:${this.cfg.PORTAL} | 起始时间:${formatBeijingTimeMs(new Date(this._startedAt))}`);
     console.log('[FLAP] 只监控启动之后新创建的代币（启动前的老币不入库、前端不显示）');
+    console.log('[FLAP] 交易者口径: TokenBought/TokenSold 的 LOG user 字段（无 tx.from 校正）');
+    console.log('[FLAP] 市值口径: LOG内价格(postPrice) x 真实总发行量(totalSupply) x BNB价（无模拟/猜测）');
     console.log(`[FLAP] 税率源: TaxTokenHelper.getTaxTokenInfoV2（买税/卖税分开，失败退回 V1）`);
     console.log(`[FLAP] 媒体网关: ${this.cfg.IPFS} （失败自动回退 ${FALLBACK_GATEWAYS.length} 个公共网关）`);
     console.log(`[FLAP] 前端显示过滤: max(买税,卖税) <= ${this.cfg.MAX_TAX_RATE}% 且 分红 = ${this.cfg.TARGET_DIVIDEND}% (dividendBps=${this.cfg.TARGET_DIVIDEND_BPS})`);
@@ -252,7 +256,7 @@ class FlapWatcher extends EventEmitter {
     check(this.cfg.TOPIC_SOLD,    SIG_SOLD,    'TOPIC_SOLD');
   }
 
-  // ── (1) 新币创建（只认启动之后的事件）─────────────────────────
+  // ── (1) 新币创建（只认启动之后的事件）─────────────────
   async _onCreatedLog(log, arrivedAt) {
     let d;
     try { d = coder.decode(CREATED_TYPES, log.data); }
@@ -289,12 +293,13 @@ class FlapWatcher extends EventEmitter {
     await this._createToken(ca, ctx);
   }
 
-  // ── (2) 买入 / 卖出 ──────────────────────────────────────────
+  // ── (2) 买入 / 卖出 ───────────────────────────────
   async _onTradeLog(log, side, arrivedAt) {
     let d;
     try { d = coder.decode(TRADE_TYPES, log.data); }
     catch (e) { console.warn('[FLAP] 交易事件解码失败:', e.message); return; }
 
+    // ★ 交易者地址完全取自 LOG：d[2] = user（不再用 tx.from 校正）
     const ca   = String(d[1]).toLowerCase();
     const user = String(d[2]).toLowerCase();
     this.stats.trades++;
@@ -311,18 +316,24 @@ class FlapWatcher extends EventEmitter {
     try { await this._ensureSupply(rec); } catch (_) {}
 
     const dec         = rec.decimals || 18;
+    // ★ 购买/卖出数量 = LOG 里的 amount 字段（d[3]），按代币 decimals 换算
     const tokenAmount = ethers.formatUnits(d[3], dec);
     const bnbAmount   = ethers.formatEther(d[4]);
     const feeAmount   = ethers.formatEther(d[5]);
+    // ★ LOG 里的价格：d[6] = postPrice（1e18 定标的「报价币 / 单个代币」）
     const postPrice   = d[6].toString();
+    const logPrice    = ethers.formatEther(d[6]);
     const time        = formatBeijingTimeMs(new Date(arrivedAt));
     const blockNumber = this._toNum(log.blockNumber);
     const sideLabel   = side === 'buy' ? '买入' : '卖出';
     this.stats.tradesVisible++;
 
-    // 市值 = 实时价格(eth/amount) x 真实总发行量 x BNB价（store.updatePrice 内完成）
+    // 定标自检（每个币只做一次，仅告警，不参与任何计算）
+    this._checkLogPrice(rec, logPrice, bnbAmount, tokenAmount);
+
+    // ★ 市值 = LOG内价格 x 真实总发行量 [x BNB价]，拿不到真实值就不写（绝不猜）
     const paymentToken = this._stableQuote(rec);
-    this.store.updatePrice(ca, bnbAmount, tokenAmount, paymentToken);
+    this.store.updateMarketCapFromLog(ca, logPrice, rec.totalSupply, !!paymentToken);
 
     const token = this.store.get(ca);
     // 与 price_update（K线市值）同一时刻、同一口径的市值
@@ -353,9 +364,9 @@ class FlapWatcher extends EventEmitter {
     this.store.addTrade(ca, {
       source: 'flap', platform: 'flap',
       side, sideLabel,
-      tokenAddress: ca, userAddress: user,
+      tokenAddress: ca, userAddress: user,   // ★ userAddress 即 LOG 里的交易者
       bnbAmount, tokenAmount,
-      fee: feeAmount, postPrice,
+      fee: feeAmount, postPrice, logPrice,
       txHash: log.transactionHash, blockNumber, time,
       symbol: paymentToken ? 'USD' : 'BNB',
       marketCapUSD,
@@ -367,7 +378,28 @@ class FlapWatcher extends EventEmitter {
     });
   }
 
-  // ── 代币解析（税率/分红过滤 + 注册）────────────────────────────
+  /**
+   * postPrice 定标自检：把 LOG 里的价格与同一条 LOG 的 eth/amount 比值对照。
+   * 只用于提醒定标是否为 1e18，结果不参与市值计算（市值永远只用 LOG 价格）。
+   */
+  _checkLogPrice(rec, logPrice, bnbAmount, tokenAmount) {
+    if (rec._priceChecked) return;
+    const p = parseFloat(logPrice)   || 0;
+    const b = parseFloat(bnbAmount)  || 0;
+    const t = parseFloat(tokenAmount) || 0;
+    if (p <= 0 || b <= 0 || t <= 0) return;
+    rec._priceChecked = true;
+    const ratio = b / t;
+    const dev = p > ratio ? p / ratio : ratio / p;
+    if (dev > 5) {
+      this.stats.logPriceWarn++;
+      console.warn(`[FLAP] ⚠ postPrice 定标异常 ${rec.symbol || rec.ca} | LOG价格(1e18解析)=${p} | 同条LOG eth/amount=${ratio} | 偏差 ${dev.toFixed(1)} 倍，请核对 postPrice 定标`);
+    } else {
+      console.log(`[FLAP] ✓ postPrice 定标自检通过 ${rec.symbol || rec.ca} | LOG价格=${p} | eth/amount=${ratio}`);
+    }
+  }
+
+  // ── 代币解析（税率/分红过滤 + 注册）────────────────────
   async _createToken(ca, ctx) {
     let rec = this._tokens.get(ca);
     if (rec) return rec;
@@ -458,7 +490,9 @@ class FlapWatcher extends EventEmitter {
       metaCid: rec.meta || null,
       quoteToken: (rec.taxInfo && rec.taxInfo.quoteToken) || null,
       marketingWallet: (rec.taxInfo && rec.taxInfo.marketingWallet) || null,
-      tamount: rec.totalSupply || String(this.cfg.defaultSupply),
+      // ★ 只写链上 totalSupply() 的真实值；拿不到就留空，不用 defaultSupply 兜底
+      tamount: rec.totalSupply || null,
+      totalSupply: rec.totalSupply || null,
     };
 
     let token = this.store.register(rec.ca, rec.symbol, rec.name, rec.programGetTime, extra);
@@ -479,7 +513,7 @@ class FlapWatcher extends EventEmitter {
     return token;
   }
 
-  // ── 税率 / 分红（★ 买税与卖税分开取真实值）──────────────────────
+  // ── 税率 / 分红（★ 买税与卖税分开取真实值）──────────────────
   async _fetchTax(ca, attempt = 0) {
     const num = (v) => Number(v || 0);
     try {
@@ -555,7 +589,7 @@ class FlapWatcher extends EventEmitter {
     }
   }
 
-  // ── 总发行量 / decimals（市值唯一口径）──────────────────────────
+  // ── 总发行量 / decimals（市值唯一口径）─────────────────────
   _ensureSupply(rec) {
     if (!rec._supplyPromise) rec._supplyPromise = this._fetchSupply(rec);
     return rec._supplyPromise;
@@ -578,12 +612,12 @@ class FlapWatcher extends EventEmitter {
         await new Promise(r => setTimeout(r, 200 * (attempt + 1)));
         return this._fetchSupply(rec, attempt + 1);
       }
-      console.warn(`[FLAP] 总发行量获取失败 ${rec.ca}: ${e.message}`);
+      console.warn(`[FLAP] 总发行量获取失败 ${rec.ca}: ${e.message}（市值不估算，等真实值）`);
       return null;
     }
   }
 
-  // ── (3) IPFS 元数据 / 媒体链接 ───────────────────────────────────
+  // ── (3) IPFS 元数据 / 媒体链接 ───────────────────────────
   async _fetchMeta(rec, attempt = 0) {
     if (rec._metaDone) return;
     let cid = rec.meta;
@@ -788,13 +822,14 @@ class FlapWatcher extends EventEmitter {
     }
   }
 
-  // ── 对外查询 ─────────────────────────────────────────────────
+  // ── 对外查询 ────────────────────────────────────
   getStats() {
     return Object.assign({}, this.stats, {
       tracked: this._tokens.size,
       connected: this.connected,
       startedAt: this._startedAt ? formatBeijingTimeMs(new Date(this._startedAt)) : null,
       taxHelperV2: this._helperV2,
+      marketCapSource: 'log.postPrice x totalSupply',
       filter: { maxTaxRate: this.cfg.MAX_TAX_RATE, targetDividendBps: this.cfg.TARGET_DIVIDEND_BPS },
     });
   }
