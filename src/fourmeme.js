@@ -20,6 +20,13 @@
  * CA 直接匹配（无缓存）：
  *   TOKEN_EVENT 到达时直接按 CA 去 store 中查找
  *   store 中有该 CA → 处理；没有 → 直接丢弃这条 four.meme WSS 数据，不做任何缓存/回放
+ *
+ * WSS 握手反爬处理：
+ *   four.meme 的 WSS 网关会对握手请求头做指纹检测，残缺的 User-Agent
+ *   或过于频繁的重连都可能被识别为脚本/攻击并返回 403。这里：
+ *   ① 发送完整、真实的浏览器请求头（UA/Referer/Accept-Language 等）
+ *   ② 断线重连使用指数退避（带抖动），连接成功后重置为基础延迟，
+ *      避免被风控网关当成扫描/攻击而升级封禁
  */
 
 const WebSocket = require('ws');
@@ -30,6 +37,9 @@ const { NETWORK, API } = require('./config');
 
 // 常量
 const FOUR_MEME_WSS = NETWORK.fourMemeWss;
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 30000;
+const RECONNECT_FACTOR = 1.7;
 
 class FourMemeWatcher extends EventEmitter {
   constructor() {
@@ -40,6 +50,7 @@ class FourMemeWatcher extends EventEmitter {
     this._reconnectTimer = null;
     this._pingTimer = null;
     this._pongTimeout = null;
+    this._reconnectDelay = RECONNECT_BASE_MS; // 指数退避当前延迟
 
     // 推文内容缓存 + 并发去重
     this._tweetCache = new Map();
@@ -82,8 +93,13 @@ class FourMemeWatcher extends EventEmitter {
     try {
       ws = new WebSocket(FOUR_MEME_WSS, {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          // ★ 完整、真实的浏览器请求头，避免被 WSS 网关指纹识别为脚本
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
           'Origin': 'https://four.meme',
+          'Referer': 'https://four.meme/',
+          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache',
         },
       });
     } catch (err) {
@@ -96,6 +112,7 @@ class FourMemeWatcher extends EventEmitter {
     ws.on('open', () => {
       if (!this.running) { ws.terminate(); return; }
       console.log('[FourMeme] ✅ 已连接');
+      this._reconnectDelay = RECONNECT_BASE_MS; // ★ 连接成功，退避重置
       this.emit('connected');
       ws.send(JSON.stringify({ method: 'SUBSCRIBE', params: ['@TOKEN_EVENT@0'], id: 1 }));
       ws.send(JSON.stringify({ method: 'SUBSCRIBE', params: ['@TICKER_EVENT'], id: 2 }));
@@ -117,7 +134,7 @@ class FourMemeWatcher extends EventEmitter {
     });
 
     ws.on('close', (code) => {
-      console.warn(`[FourMeme] 断开 (code=${code})，1s 后重连...`);
+      console.warn(`[FourMeme] 断开 (code=${code})`);
       this._stopPing();
       this.ws = null;
       this.emit('disconnected');
@@ -133,7 +150,12 @@ class FourMemeWatcher extends EventEmitter {
     if (!this.running || this.reconnecting) return;
     this.reconnecting = true;
     this._clearReconnect();
-    this._reconnectTimer = setTimeout(() => { if (this.running) this._connect(); }, 1000);
+
+    // ★ 指数退避 + 随机抖动，避免被风控网关当成扫描/攻击而升级封禁
+    const delay = Math.min(this._reconnectDelay, RECONNECT_MAX_MS) + Math.floor(Math.random() * 300);
+    console.warn(`[FourMeme] ${delay}ms 后重连...`);
+    this._reconnectTimer = setTimeout(() => { if (this.running) this._connect(); }, delay);
+    this._reconnectDelay = Math.min(Math.round(this._reconnectDelay * RECONNECT_FACTOR), RECONNECT_MAX_MS);
   }
 
   _clearReconnect() {
