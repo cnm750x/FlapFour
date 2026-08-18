@@ -12,6 +12,7 @@
  *      • K线市值与交易明细市值统一用后端 USD 原值，K / M 保留2位小数
  *      • K线横坐标：每根蜡烛 = 5 秒，每 6 根（30秒）一个时间刻度
  *      • 交易明细内所有数字字号 = 原字号 x 1.5
+ *      • 交易者地址：显示完整 40 位地址（不再缩写为 0x1234...abcd），方便直接复制核对
  *      • 命中追踪(KOL)钱包：整条背景金黄色 + 地址位置直接显示 KOL 名字
  */
 
@@ -97,7 +98,7 @@
       // ★ 交易明细里所有数字 x1.5（原 9px → 13.5px）
       + '.fm-trade-item{font-size:13.5px !important;line-height:1.45 !important;padding:1px 2px !important}'
       + '.fm-trade-item span{font-size:13.5px !important}'
-      + '.fm-trade-item .fm-addr{max-width:none !important}'
+      + '.fm-trade-item .fm-addr{max-width:none !important;white-space:nowrap !important;overflow:visible !important;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace !important;letter-spacing:-.2px !important}'
       // ★ KOL 钱包命中：整条金黄色背景
       + '.fm-kol{background:linear-gradient(90deg,#ffd700 0%,#ffc107 100%) !important;'
       + 'border-left:3px solid #ff9800 !important;border-radius:3px !important;'
@@ -682,7 +683,7 @@
     ctx.textAlign = 'center';
   }
 
-  // ── 新 renderFmTradePanel：市值用后端 USD 原值；字号 x1.5；KOL 金黄色整行 + 显示钱包名 ──
+  // ── 新 renderFmTradePanel：市值用后端 USD 原值；字号 x1.5；地址显示完整 40 位；KOL 金黄色整行 + 显示钱包名 ──
   function renderFmTradePanel(tokenId) {
     var key = String(tokenId || '').toLowerCase();
     var panel = document.getElementById('fm-trades-' + key);
@@ -737,7 +738,8 @@
 
       var watch = isKol(t);
       var name = kolName(t);
-      var addrDisp = (watch && name) ? name : shortA(addr);   // ★ KOL 显示名字
+      // ★ 不再缩写地址：非 KOL 时直接显示完整 40 位地址，方便直接复制比对
+      var addrDisp = (watch && name) ? name : addr;
 
       var div = document.createElement('div');
       div.className = 'fm-trade-item' + (watch ? ' fm-kol' : '');
@@ -785,7 +787,7 @@
       renderFmTradePanel(p.id.replace('fm-trades-', ''));
     });
 
-    console.log('[mc-fix] 市值统一(USD)、K线5秒/格、交易明细字号x1.5、KOL钱包金黄色整行高亮');
+    console.log('[mc-fix] 市值统一(USD)、K线5秒/格、交易明细字号x1.5、地址全显不缩写、KOL钱包金黄色整行高亮');
   }
 
   if (document.readyState === 'loading') {
