@@ -10,7 +10,9 @@
  * 本版要点：
  *   ① 媒体竞速：只在 1200ms 后请求一次（已删除 800ms / 1000ms 两轮）
  *   ② four.meme WSS 媒体链接：直接按 CA 匹配 store，不命中直接丢弃（无缓冲）
- *   ③ 交易明细地址与 GMGN 对齐：用 maker.js 解析 tx.from 后推送 trade_maker 补丁
+ *   ③ ★ FLAP 交易明细完全以链上 LOG 为准：交易者地址/数量/价格均取自
+ *       TokenBought / TokenSold 的日志字段；tx.from 校正逻辑（maker.js）已删除。
+ *       市值 = LOG内价格(postPrice) x 真实总发行量(totalSupply) x BNB价。
  *   ④ 税率/分红：只下发 FLAP 代币，four.meme 不再下发/展示
  */
 
@@ -27,14 +29,13 @@ const ChainWatcher = require('./chain');
 const FourMemeWatcher = require('./fourmeme');
 const FlapWatcher = require('./flap');
 const { FlapTradeService, TradeRouter } = require('./flap-trade');
-const { MakerResolver } = require('./maker');
 const flapConfig = require('./flap-config');
 const TradingEngine = require('./trader');
 const Storage = require('./storage');
 const { TRADE, NETWORK, WATCH_WALLETS } = require('./config');
 const { formatBeijingTimeMs, toReadableTwitter, extractTweetId } = require('./utils');
 
-// ─── 配置组合 ───────────────────────────────
+// ─── 配置组合 ──────────────────────────────
 const config = {
   privateKey:            TRADE.privateKey,
   bscRpcUrl:             NETWORK.bscRpcUrl,
@@ -58,15 +59,17 @@ const config = {
   approveGasLimit:       TRADE.approveGasLimit,
 };
 
-// ─── 服务初始化 ───────────────────────────
+// ─── 服务初始化 ─────────────────────────
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-// 首页：注入平台角标脚本（不侵入修改 public/index.html）
+// 首页：注入平台角标脚本 + 列宽微调脚本（不侵入修改 public/index.html）
 const PUBLIC_DIR = path.join(__dirname, '../public');
 const INDEX_HTML_PATH = path.join(PUBLIC_DIR, 'index.html');
-const BADGE_TAG = '<script src="/flap-badge.js"></script>';
+const BADGE_TAG  = '<script src="/flap-badge.js"></script>';
+// ★ 交易活动 / 信号列宽度 +100px（300px → 400px）
+const TWEAKS_TAG = '<script src="/flap-ui-tweaks.js"></script>';
 let _indexHtmlCache = null;
 let _indexHtmlMtime = 0;
 
@@ -75,10 +78,14 @@ function renderIndexHtml() {
     const stat = fsSync.statSync(INDEX_HTML_PATH);
     if (_indexHtmlCache && stat.mtimeMs === _indexHtmlMtime) return _indexHtmlCache;
     let html = fsSync.readFileSync(INDEX_HTML_PATH, 'utf8');
-    if (!html.includes('/flap-badge.js')) {
+    const tags = [];
+    if (!html.includes('/flap-badge.js'))     tags.push(BADGE_TAG);
+    if (!html.includes('/flap-ui-tweaks.js')) tags.push(TWEAKS_TAG);
+    if (tags.length) {
+      const inject = tags.join('\n');
       html = html.includes('</body>')
-        ? html.replace('</body>', `${BADGE_TAG}\n</body>`)
-        : html + `\n${BADGE_TAG}\n`;
+        ? html.replace('</body>', `${inject}\n</body>`)
+        : html + `\n${inject}\n`;
     }
     _indexHtmlCache = html;
     _indexHtmlMtime = stat.mtimeMs;
@@ -120,10 +127,7 @@ const store = new TokenStore({
   onMatched: (token) => trader.onMatched(token),  // 追踪钱包买入触发
 });
 
-// ★ 真实交易者（GMGN 口径）解析：事件里的入账地址 → tx.from
-const makerResolver = new MakerResolver({ rpcUrl: NETWORK.bscRpcUrl });
-store.setMakerResolver(makerResolver);
-store.setWatchWallets(WATCH_WALLETS);
+// ★ 交易者地址不再做任何校正：直接用 LOG 里的地址（maker.js 已删除）
 
 const chain = new ChainWatcher();
 chain.store = store;
@@ -135,7 +139,7 @@ const flap = new FlapWatcher({ config: flapConfig, watchWallets: WATCH_WALLETS }
 flap.store = store;
 if (typeof flap.setStore === 'function') flap.setStore(store);
 
-// ─── 恢复持久化 MEME ────────────────────────────
+// ─── 恢复持久化 MEME ───────────────────────
 const restoredMemes = storage.loadAllMemes();
 if (restoredMemes.length > 0) {
   let restored = 0;
@@ -157,7 +161,7 @@ if (restoredMemes.length > 0) {
   console.log(`[Server] \u267B\uFE0F 恢复 ${restored} 个持久化MEME到内存`);
 }
 
-// ─── 运行时状态 ─────────────────────────
+// ─── 运行时状态 ──────────────────────
 let bnbPriceUSD = config.fixedBNBPrice;
 let wsChainStatus = false;
 let wsFourmemeStatus = false;
@@ -168,7 +172,7 @@ let bnbBalance = '—';
 const walletTxHistory = (storage.state.walletTxHistory || []).slice(0, 500);
 console.log(`[Server] \u267B\uFE0F 恢复 walletTxHistory: ${walletTxHistory.length} 条`);
 
-// ─── 辅助 ───────────────────────────────
+// ─── 辅助 ──────────────────────────────
 function syncBNBPrice(price) {
   if (price > 0) {
     bnbPriceUSD = price;
@@ -210,7 +214,7 @@ function platformMap() {
   }));
 }
 
-// ─── four.meme API 媒体竞速（★ 只在 1200ms 后一次）───────────
+// ─── four.meme API 媒体竞速（★ 只在 1200ms 后一次）───────
 const FOUR_MEME_API_URL = NETWORK.fourMemeApi;
 const API_RACE_DELAY_MS = 1200;   // 已删除 800ms / 1000ms 两轮，仅保留这一次
 const UA_POOL = [
@@ -286,7 +290,7 @@ async function pollFourMemeApi(ca) {
   apiPollingMap.delete(ca);
 }
 
-// ─── 事件监听 ──────────────────────────
+// ─── 事件监听 ─────────────────────────
 store.on('registered', (token) => {
   io.emit('new_token', token);
   io.emit('token_count', { count: store.size });
@@ -371,8 +375,8 @@ store.on('trade_added', ({ token, trade }) => {
   io.emit('fm_trade', {
     source:          trade.source || 'chain',
     tokenAddress:    trade.tokenAddress,
+    // ★ userAddress 即链上 LOG 里的交易者地址（无任何校正/补丁）
     userAddress:     trade.userAddress,
-    eventAddress:    trade.eventAddress || null,
     tokenName:       token.name || trade.tokenName || trade.tokenAddress,
     volume:          trade.bnbAmount,
     side:            trade.side === 'buy' ? 1 : 2,
@@ -395,11 +399,6 @@ store.on('trade_added', ({ token, trade }) => {
   if (token.bought || token.matchReason) {
     setImmediate(() => storage.persistTrade(token));
   }
-});
-
-// ★ 交易者校正补丁（事件入账地址 → tx.from，与 GMGN 一致）
-store.on('trade_maker', (patch) => {
-  io.emit('trade_maker', patch);
 });
 
 // 追踪钱包交易（four.meme 与 FLAP 共用）
@@ -452,7 +451,7 @@ trader.on('trade', (trade) => {
 });
 trader.on('trade_update', (patch) => { io.emit('trade_update', patch); });
 
-// ─── Socket.IO 连接 ────────────────────────────
+// ─── Socket.IO 连接 ────────────────────────
 io.on('connection', (socket) => {
   console.log('[Server] 前端已连接:', socket.id);
   socket.emit('init', {
@@ -491,8 +490,7 @@ io.on('connection', (socket) => {
   });
 });
 
-// ─── REST API ────────────────────────────────
-app.get('/api/status', (_req, res) => res.json({
+// ─── REST API ─────────────────────────────napp.get('/api/status', (_req, res) => res.json({
   wsStatus:     wsChainStatus ? '链上已连接' : '未连接',
   wsChain:      wsChainStatus,
   wsFourmeme:   wsFourmemeStatus,
@@ -526,7 +524,7 @@ app.get('/api/flap/tokens', (_req, res) => {
   res.json({ tokens, total: tokens.length, onlyVisible, stats: (typeof flap.getStats === 'function' ? flap.getStats() : null) });
 });
 
-// ─── 优雅退出 ──────────────────────────────────
+// ─── 优雅退出 ─────────────────────────────
 function gracefulShutdown(signal) {
   console.log(`\n[Server] 收到 ${signal}，安全退出...`);
   chain.stop();
@@ -563,9 +561,10 @@ function gracefulShutdown(signal) {
           arrivalTime: token.arrivalTime, tamount: token.tamount,
         },
         trades: (token.trades || []).slice(-200).map(t => ({
-          side: t.side, userAddress: t.userAddress, eventAddress: t.eventAddress || null,
+          side: t.side, userAddress: t.userAddress,
           walletName: t.walletName || null, bnbAmount: t.bnbAmount,
           tokenAmount: t.tokenAmount, txHash: t.txHash, time: t.time, marketCapUSD: t.marketCapUSD || 0,
+          postPrice: t.postPrice || null, logPrice: t.logPrice || null,
           platform: t.platform || token.platform || 'four',
         })),
       });
@@ -584,20 +583,17 @@ process.on('uncaughtException', (err) => {
   storage.flushSync();
 });
 
-// ─── 启动 ───────────────────────────────────
+// ─── 启动 ───────────────────────────────
 async function main() {
   console.log('');
-  console.log('╭──────────────────────────────────────────────╮');
+  console.log('╭──────────────────────────────────────────╮');
   console.log('│  BitSticker — 追踪钱包狙击策略自动交易机器人（four.meme + FLAP）   │');
-  console.log('╰──────────────────────────────────────────────╯');
+  console.log('╰──────────────────────────────────────────╯');
   console.log('');
 
   const chainOk = await blockchain.init();
   walletAddress = blockchain.getWalletAddress();
   if (chainOk) await updateWalletBalance();
-
-  // 交易者解析复用已初始化的 provider（没有则用自建 RPC）
-  if (blockchain.provider) makerResolver.setProvider(blockchain.provider);
 
   setInterval(updateWalletBalance, 60_000);
   setInterval(() => {
@@ -617,7 +613,8 @@ async function main() {
     console.log(`[Server] 钱包: ${WATCH_WALLETS.length} 个`);
     console.log(`[Server] FLAP: Portal ${flapConfig.PORTAL} | 前端过滤 税率≤${flapConfig.MAX_TAX_RATE}% 且 分红=${flapConfig.TARGET_DIVIDEND}%`);
     console.log(`[Server] 媒体竞速: 仅 ${API_RACE_DELAY_MS}ms 后一次（已删除800/1000ms）| four.meme WSS: CA直接匹配，不命中丢弃（无缓冲）`);
-    console.log(`[Server] 交易者口径: 事件入账地址 → tx.from（与GMGN一致）`);
+    console.log(`[Server] 交易者口径: 纯链上 LOG（TokenBought/TokenSold 的 user 字段），无 tx.from 校正`);
+    console.log(`[Server] 市值口径: LOG内价格(postPrice) × 真实总发行量(totalSupply) × BNB价（无模拟/猜测）`);
     console.log('');
   });
 }
