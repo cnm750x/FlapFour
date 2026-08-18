@@ -490,7 +490,8 @@ io.on('connection', (socket) => {
   });
 });
 
-// ─── REST API ─────────────────────────────napp.get('/api/status', (_req, res) => res.json({
+// ─── REST API ─────────────────────────────
+app.get('/api/status', (_req, res) => res.json({
   wsStatus:     wsChainStatus ? '链上已连接' : '未连接',
   wsChain:      wsChainStatus,
   wsFourmeme:   wsFourmemeStatus,
